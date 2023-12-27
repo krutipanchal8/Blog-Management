@@ -1,0 +1,946 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Resources:
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-06d4b7182ac3480fa
+      InstanceType: t2.large
+      KeyName: term-assn
+      SecurityGroups:
+        - Ref: SecurityGroup
+      Tags:
+        - Key: Name
+          Value: cloud-term-instance
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          sudo su
+          cd /home/ec2-user
+          yum update -y
+          yum install -y git
+          yum install -y nodejs
+          git clone https://kbpanchal:glpat-7McYMNNWhWsxiRP_oSDf@git.cs.dal.ca/courses/2023-fall/csci5409/kbpanchal.git
+          cd /home/ec2-user/kbpanchal/termassignment/frontend/
+          npm install pm2@latest -g
+          npm install
+          pm2 start --name BlogSphere npm -- start
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH traffic
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: BlogPosts
+      AttributeDefinitions:
+        - AttributeName: BlogID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: BlogID
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+
+  DynamoDBUserTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: UserInfo
+      AttributeDefinitions: 
+        - AttributeName: userID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userID
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+
+  # DynamoDb Backup Valut
+  DynamoDBBackupVault:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: DynamoDBBackupVault
+      
+  DynamoDBBackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: DynamoDBBackupPlan
+        BackupPlanRule:
+          - RuleName: DynamoDBBackupRule
+            TargetBackupVault: !Ref DynamoDBBackupVault
+            ScheduleExpression: cron(0 12 * * ? *)
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 10080
+            Lifecycle:
+              DeleteAfterDays: 30
+
+  # DynamoDB Backup Selection
+  DynamoDBBackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref DynamoDBBackupPlan
+      BackupSelection:
+        SelectionName: DynamoDBBackupSelection
+        IamRoleArn: !GetAtt DynamoDBBackupRole.Arn
+        Resources:
+          - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/BlogPosts"
+
+  DynamoDBBackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DynamoDBBackupRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - backup.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: DynamoDBBackupPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:*
+                Resource: "*"
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: LambdaDynamoDBCloudWatchPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:*
+                  - logs:*
+                Resource: "*"
+
+  GetBlogsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetBlogs
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          # Initialize a DynamoDB client with Boto3
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('BlogPosts')
+
+          def lambda_handler(event, context):
+              try:
+                  # Scan the DynamoDB table
+                  response = table.scan()
+
+                  # Return a successful response
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(response.get('Items', []))
+                  }
+              except ClientError as error:
+                  # Log and return the error if the operation fails
+                  print(f'DynamoDB Error: {error}')
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'Failed to retrieve blog posts',
+                          'details': str(error)
+                      })
+                  }
+
+
+  DeleteABlogPostFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DeleteABlogPost
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          # Initialize a DynamoDB client with Boto3
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('BlogPosts')
+
+          def lambda_handler(event, context):
+              print("Event: ", event)
+
+              # Check if the body exists in the event
+              if not event.get('body'):
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'No request body provided'})
+                  }
+
+              # Parse the request body and retrieve BlogID
+              try:
+                  parsed_body = json.loads(event['body'])
+                  blog_id = parsed_body.get('BlogID')
+                  if not blog_id:
+                      raise ValueError("BlogID not provided in the request body")
+              except (json.JSONDecodeError, ValueError) as error:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': str(error)})
+                  }
+
+              # Delete the blog post from the DynamoDB table
+              try:
+                  table.delete_item(
+                      Key={
+                          'BlogID': blog_id
+                      }
+                  )
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'Blog post deleted successfully'})
+                  }
+              except ClientError as error:
+                  print(f'DynamoDB Error: {error}')
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'Failed to delete the blog post', 'details': str(error)})
+                  }
+
+  CreateAUsersFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CreateAUsers
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('UserInfo')
+
+          def lambda_handler(event, context):
+              if not event.get('body'):
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'No request body provided'})
+                  }
+
+              try:
+                  parsed_body = json.loads(event['body'])
+              except json.JSONDecodeError:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'Invalid JSON in request body'})
+                  }
+
+              userId = parsed_body.get('userID')
+              email = parsed_body.get('email')
+
+              # Check if email already exists
+              try:
+                  response = table.scan(
+                      FilterExpression='email = :email',
+                      ExpressionAttributeValues={':email': email}
+                  )
+                  if response.get('Items'):
+                      # Email already exists
+                      return {
+                          'statusCode': 409,
+                          'body': json.dumps({'error': 'Email already registered'})
+                      }
+
+                  # Proceed to create new user
+                  table.put_item(
+                      Item={
+                          'userID': userId,
+                          'firstName': parsed_body.get('firstName'),
+                          'lastName': parsed_body.get('lastName'),
+                          'email': email,
+                          'password': parsed_body.get('password')
+                      }
+                  )
+                  return {
+                      'statusCode': 201,
+                      'body': json.dumps({'message': 'User created successfully', 'userId': userId})
+                  }
+              except ClientError as error:
+                  print(f'DynamoDB Error: {error}')
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'Failed to create the user', 'details': str(error)})
+                  }
+
+  CreateBlogPostFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CreateBlogPost
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          # Initialize a DynamoDB client with Boto3
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('BlogPosts')
+
+          def lambda_handler(event, context):
+              print("Event: ",event)
+              if not event.get('body'):
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'No request body provided'})
+                  }
+
+              try:
+                  parsed_body = json.loads(event['body'])
+              except json.JSONDecodeError:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'Invalid JSON in request body'})
+                  }
+
+              title = parsed_body.get('title')
+              author = parsed_body.get('author')
+              content = parsed_body.get('content')
+              date_posted = parsed_body.get('DatePosted')
+              email = parsed_body.get('email')
+              blog_id = parsed_body.get('BlogID')  # Assuming BlogID is provided in the request
+              summary = parsed_body.get('summary')
+              print("Blog id: ",blog_id)
+
+              params = {
+                  'TableName': 'BlogPosts',
+                  'Item': {
+                      'BlogID': blog_id,
+                      'email' : email,
+                      'title': title,
+                      'author': author,
+                      'content': content,
+                      'DatePosted': date_posted,
+                      'summary': summary
+                  },
+                  'ConditionExpression': 'attribute_not_exists(BlogID)'
+              }
+
+              try:
+                  table.put_item(Item=params['Item'], ConditionExpression=params['ConditionExpression'])
+                  return {
+                      'statusCode': 201,
+                      'body': json.dumps({'message': 'Blog post created successfully', 'BlogID': blog_id})
+                  }
+              except ClientError as error:
+                  if error.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                      return {
+                          'statusCode': 409,
+                          'body': json.dumps({'error': 'Blog post with the same BlogID already exists'})
+                      }
+                  else:
+                      print(f'DynamoDB Error: {error}')
+                      return {
+                          'statusCode': 500,
+                          'body': json.dumps({'error': 'Failed to create the blog post', 'details': str(error)})
+                      }
+
+
+  LoginUserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: LoginUser
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('UserInfo')  # Adjust with your table name
+
+          def lambda_handler(event, context):
+              if not event.get('body'):
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'No request body provided'})
+                  }
+
+              try:
+                  parsed_body = json.loads(event['body'])
+                  email = parsed_body.get('email')
+                  password = parsed_body.get('password')
+
+                  response = table.scan(
+                      FilterExpression='email = :email and password = :password',
+                      ExpressionAttributeValues={':email': email, ':password': password}
+                  )
+                  if response.get('Items'):
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({'message': 'Login successful'})
+                      }
+                  else:
+                      return {
+                          'statusCode': 401,
+                          'body': json.dumps({'error': 'Invalid email or password'})
+                      }
+              except ClientError as error:
+                  print(f'DynamoDB Error: {error}')
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'An error occurred during login'})
+                  }
+
+  GetBlogsForBlogIDFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetBlogsForBlogID
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          # Initialize a DynamoDB client with Boto3
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('BlogPosts')
+
+          def lambda_handler(event, context):
+              try:
+                  # Parse the incoming event body to get the BlogID
+                  request_body = json.loads(event['body'])
+                  blog_id = request_body['BlogID']
+
+                  # Retrieve the specific item from the DynamoDB table
+                  response = table.get_item(
+                      Key={
+                          'BlogID': blog_id
+                      }
+                  )
+
+                  # Return the item if found
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(response.get('Item', {}))
+                  }
+              except ClientError as error:
+                  # Log and return the error if the operation fails
+                  print(f'DynamoDB Error: {error}')
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'Failed to retrieve the blog post',
+                          'details': str(error)
+                      })
+                  }
+
+  UpdateBlogFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UpdateBlog
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          # Initialize a DynamoDB client with Boto3
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('BlogPosts')
+
+          def lambda_handler(event, context):
+              if not event.get('body'):
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'No request body provided'})
+                  }
+
+              try:
+                  parsed_body = json.loads(event['body'])
+              except json.JSONDecodeError:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'Invalid JSON in request body'})
+                  }
+
+              blog_id = parsed_body.get('BlogID')
+              if not blog_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'BlogID is required'})
+                  }
+
+              try:
+                  # Construct the update expression and attribute values
+                  update_expression = "set title = :t, author = :a, content = :c, DatePosted = :dp, email = :e, summary = :s"
+                  expression_attribute_values = {
+                      ':t': parsed_body.get('title'),
+                      ':a': parsed_body.get('author'),
+                      ':c': parsed_body.get('content'),
+                      ':dp': parsed_body.get('DatePosted'),
+                      ':e': parsed_body.get('email'),
+                      ':s': parsed_body.get('summary')
+                  }
+
+                  # Update the item in DynamoDB
+                  table.update_item(
+                      Key={'BlogID': blog_id},
+                      UpdateExpression=update_expression,
+                      ExpressionAttributeValues=expression_attribute_values
+                  )
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'Blog post updated successfully', 'BlogID': blog_id})
+                  }
+              except ClientError as error:
+                  print(f'DynamoDB Error: {error}')
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'Failed to update the blog post', 'details': str(error)})
+                  }
+
+  BlogApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: BlogApi
+      Description: API Gateway for blog operations
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  GetBlogsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BlogApi
+      ResourceId: !GetAtt BlogApi.RootResourceId
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetBlogsFunction.Arn}/invocations
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  CreateBlogPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BlogApi
+      ResourceId: !GetAtt BlogApi.RootResourceId
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateBlogPostFunction.Arn}/invocations
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  DeleteBlogPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BlogApi
+      ResourceId: !GetAtt BlogApi.RootResourceId
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DeleteABlogPostFunction.Arn}/invocations
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  UpdateBlogMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BlogApi
+      ResourceId: !GetAtt BlogApi.RootResourceId
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UpdateBlogFunction.Arn}/invocations
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  LoginResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref BlogApi
+      ParentId: !GetAtt BlogApi.RootResourceId
+      PathPart: 'login'
+
+  PostResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref BlogApi
+      ParentId: !GetAtt BlogApi.RootResourceId
+      PathPart: 'post'
+
+  RegisterResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref BlogApi
+      ParentId: !GetAtt BlogApi.RootResourceId
+      PathPart: 'register'
+
+  LoginUserMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BlogApi
+      ResourceId: !Ref LoginResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LoginUserFunction.Arn}/invocations
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  GetBlogForBlogIDMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BlogApi
+      ResourceId: !Ref PostResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetBlogsForBlogIDFunction.Arn}/invocations
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  RegisterUserMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BlogApi
+      ResourceId: !Ref RegisterResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateAUsersFunction.Arn}/invocations
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  RootOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BlogApi
+      ResourceId: !GetAtt BlogApi.RootResourceId
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: "{\"statusCode\": 200}"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  LoginOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BlogApi
+      ResourceId: !Ref LoginResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: "{\"statusCode\": 200}"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  PostOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BlogApi
+      ResourceId: !Ref PostResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: "{\"statusCode\": 200}"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  RegisterOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BlogApi
+      ResourceId: !Ref RegisterResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: "{\"statusCode\": 200}"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Lambda Permissions for GetBlogsFunction
+  GetBlogsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt GetBlogsFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BlogApi}/*/*
+
+  # Lambda Permissions for DeleteABlogPostFunction
+  DeleteABlogPostInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt DeleteABlogPostFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BlogApi}/*/*
+
+  # Lambda Permissions for CreateAUsersFunction
+  CreateAUsersInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CreateAUsersFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BlogApi}/*/*
+
+  # Lambda Permissions for CreateBlogPostFunction
+  CreateBlogPostInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CreateBlogPostFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BlogApi}/*/*
+
+  # Lambda Permissions for LoginUserFunction
+  LoginUserInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LoginUserFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BlogApi}/*/*
+
+  # Lambda Permissions for GetBlogsForBlogIDFunction
+  GetBlogsForBlogIDInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt GetBlogsForBlogIDFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BlogApi}/*/*
+
+  # Lambda Permissions for UpdateBlogFunction
+  UpdateBlogInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt UpdateBlogFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BlogApi}/*/*
+
+  BlogAPIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GetBlogsMethod
+      - CreateBlogPostMethod
+      - DeleteBlogPostMethod
+      - UpdateBlogMethod
+      - LoginUserMethod
+      - GetBlogForBlogIDMethod
+      - RegisterUserMethod
+      - RootOptionsMethod
+      - LoginOptionsMethod
+      - PostOptionsMethod
+      - RegisterOptionsMethod
+    Properties:
+      RestApiId: !Ref BlogApi
+      StageName: prod
+
+  ApiGatewaySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: /api-gateway-url
+      Description: Backend Public IP
+      SecretString: !Sub 'https://${BlogApi}.execute-api.${AWS::Region}.amazonaws.com/prod/'
+
+Outputs:
+  PublicIP:
+    Description: Public IP address of the newly created EC2 instance
+    Value: !Sub 'http://${EC2Instance.PublicIp}:3000'
+  RootLambdaFunctionUrl:
+    Description: "URL for the root Lambda function"
+    Value: 
+      !Sub 'https://${BlogApi}.execute-api.${AWS::Region}.amazonaws.com/prod/'
+
+  
